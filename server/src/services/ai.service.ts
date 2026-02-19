@@ -1,7 +1,4 @@
-// server/src/services/ai.service.ts
 import 'dotenv/config';
-import { generateText, streamText } from 'ai';
-import { fireworks } from '@ai-sdk/fireworks';
 
 export interface AIMessage {
   role: 'system' | 'user' | 'assistant';
@@ -25,7 +22,6 @@ export interface AIConfig {
 
 export class AIService {
   private providers: string[];
-  private currentProviderIndex = 0;
 
   constructor() {
     this.providers = this.detectAvailableProviders();
@@ -34,36 +30,22 @@ export class AIService {
 
   private detectAvailableProviders(): string[] {
     const available: string[] = [];
-    
-    // Проверяем Fireworks
-    if (process.env.FIREWORKS_API_KEY) {
-      available.push('fireworks');
-    }
-    
-    // Проверяем OpenAI
-    if (process.env.OPENAI_API_KEY) {
-      available.push('openai');
-    }
-    
-    // Проверяем OpenRouter
+
     if (process.env.OPENROUTER_API_KEY) {
       available.push('openrouter');
     }
-    
-    // Всегда добавляем fallback
+
     available.push('fallback');
-    
-    // Сортируем согласно AI_PROVIDER
-    const preferredProvider = process.env.AI_PROVIDER || 'fireworks';
+
+    const preferredProvider = process.env.AI_PROVIDER || 'openrouter';
     if (available.includes(preferredProvider)) {
-      // Перемещаем предпочтительный провайдер в начало
       const index = available.indexOf(preferredProvider);
       if (index > 0) {
         available.splice(index, 1);
         available.unshift(preferredProvider);
       }
     }
-    
+
     return available;
   }
 
@@ -77,92 +59,85 @@ export class AIService {
     }
 
     const provider = this.providers[attempt];
-    
+
     try {
       switch (provider) {
-        case 'fireworks':
-          return await this.callFireworksAPI(messages, config);
+        case 'openrouter':
+          return await this.callOpenRouterAPI(messages, config);
         case 'fallback':
           return this.fallbackResponse(messages);
         default:
           throw new Error(`Unknown provider: ${provider}`);
       }
     } catch (error: any) {
-      console.warn(`⚠️ Provider ${provider} failed:`, error.message);
-      
-      // Если это региональная блокировка, сразу переходим к следующему
-      if (error.message.includes('region') || error.message.includes('not available')) {
+      console.warn(`⚠️ Provider ${provider} failed:`, error?.message || error);
+
+      const emsg = String(error?.message || error || '');
+      if (emsg.includes('region') || emsg.includes('not available')) {
         console.log(`🌍 ${provider} unavailable in your region, trying next...`);
       }
-      
-      // Пробуем следующий провайдер
+
       return this.tryWithProviders(messages, config, attempt + 1);
     }
   }
 
-  // Fireworks API (через Vercel AI SDK)
-  private async callFireworksAPI(messages: AIMessage[], config: AIConfig): Promise<AIResponse> {
-    const apiKey = process.env.FIREWORKS_API_KEY;
+  // --- OpenRouter via fetch (DeepSeek) ---
+  private async callOpenRouterAPI(messages: AIMessage[], config: AIConfig): Promise<AIResponse> {
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
-      throw new Error('Fireworks API key not configured');
+      throw new Error('OpenRouter API key not configured');
     }
 
-    const model = config.model || 
-      process.env.FIREWORKS_MODEL || 
-      'accounts/fireworks/models/llama-v3p1-8b-instruct';
-    
-    const maxTokens = config.maxTokens || 
-      parseInt(process.env.DEFAULT_MAX_TOKENS || '512');
-    
-    const temperature = config.temperature || 0.7;
-    
-    // Подготавливаем сообщения для AI SDK
+    const model = config.model || process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1-0528:free';
+    const maxTokens = config.maxTokens || parseInt(process.env.DEFAULT_MAX_TOKENS || '512');
+    const temperature = typeof config.temperature === 'number'
+      ? config.temperature
+      : parseFloat(process.env.DEFAULT_TEMPERATURE || '0.7');
+
     const aiMessages = this.limitContext(messages);
-    
-    // Если есть системный промпт, добавляем его
-    const systemMessage = aiMessages.find(m => m.role === 'system');
-    const systemPrompt = config.systemPrompt || systemMessage?.content;
-    const otherMessages = aiMessages.filter(m => m.role !== 'system');
 
-    try {
-      const { text, usage, finishReason } = await generateText({
-        model: fireworks(model),
-        system: systemPrompt,
-        messages: otherMessages,
-        //maxTokens,
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.APP_URL || 'http://localhost',
+        'X-Title': process.env.APP_NAME || 'AI Assistant'
+      },
+      body: JSON.stringify({
+        model,
+        messages: aiMessages,
         temperature,
-      });
+        max_tokens: maxTokens,
+      }),
+    });
 
-      return {
-        content: text,
-        tokens: usage?.totalTokens,
-        provider: 'fireworks',
-        finishReason: finishReason
-      };
-    } catch (error: any) {
-      console.error('Fireworks API error:', error);
-      // Если это ошибка аутентификации, пробуем другой провайдер
-      if (error.message?.includes('auth') || error.message?.includes('401') || error.message?.includes('403')) {
-        console.log('🔑 Fireworks authentication failed, trying next provider...');
-        throw error;
-      }
-      // Для других ошибок пробуем переключиться
-      throw new Error(`Fireworks error: ${error.message}`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`OpenRouter HTTP ${response.status}: ${text}`);
     }
+
+    const data: any = await response.json();
+
+    return {
+      content: data.choices?.[0]?.message?.content || '',
+      tokens: data.usage?.total_tokens,
+      provider: 'openrouter',
+      finishReason: data.choices?.[0]?.finish_reason,
+    };
   }
-  
 
   private fallbackResponse(messages: AIMessage[]): AIResponse {
     const lastMessage = messages[messages.length - 1]?.content || '';
-    
+
     const responses = [
-      "Привет! Я ваш AI ассистент. Сейчас работаю в демо-режиме. Добавьте API ключ от Fireworks, OpenAI или другого провайдера в .env для полноценной работы.",
-      "Чтобы получить реальные ответы от AI, настройте подключение к одному из сервисов:\n1. Fireworks AI (рекомендуется)\n2. OpenAI\n3. OpenRouter",
-      "Демо-режим. Получите API ключ на https://fireworks.ai/ и добавьте FIREWORKS_API_KEY в .env"
+      'Привет! Я ваш AI ассистент. Сейчас работаю в демо-режиме. Добавьте OPENROUTER_API_KEY в .env для полноценной работы.',
+      'Чтобы получить реальные ответы от AI, настройте OpenRouter и добавьте OPENROUTER_API_KEY в .env.',
+      'Демо-режим. Получите API ключ на OpenRouter и добавьте OPENROUTER_API_KEY в .env'
     ];
-    
+
     const response = responses[Math.floor(Math.random() * responses.length)];
-    
+
     return {
       content: `${response}\n\nВаш запрос: "${lastMessage.substring(0, 100)}..."`,
       provider: 'fallback'
@@ -197,7 +172,6 @@ export class AIService {
     let totalTokens = 0;
     const limitedMessages: AIMessage[] = [];
 
-    // Всегда оставляем системное сообщение
     const systemMessage = messages.find(m => m.role === 'system');
     if (systemMessage) {
       const estimatedTokens = Math.ceil(systemMessage.content.length / 4);
@@ -205,12 +179,11 @@ export class AIService {
       limitedMessages.push(systemMessage);
     }
 
-    // Остальные сообщения с конца (новые важнее)
     const otherMessages = messages.filter(m => m.role !== 'system').reverse();
-    
+
     for (const message of otherMessages) {
       const estimatedTokens = Math.ceil(message.content.length / 4);
-      
+
       if (totalTokens + estimatedTokens > maxTokens) {
         break;
       }
@@ -219,7 +192,6 @@ export class AIService {
       limitedMessages.push(message);
     }
 
-    // Восстанавливаем порядок
     limitedMessages.sort((a, b) => {
       if (a.role === 'system') return -1;
       if (b.role === 'system') return 1;
@@ -234,54 +206,71 @@ export class AIService {
       const result = await this.chat([
         { role: 'user', content: 'Hello' }
       ], { maxTokens: 5 });
-      
-      return { 
-        success: true, 
-        provider: result.provider || 'unknown' 
+
+      return {
+        success: true,
+        provider: result.provider || 'unknown'
       };
     } catch (error: any) {
-      console.error('AI connection test failed:', error.message);
+      console.error('AI connection test failed:', error?.message || error);
       return { success: false };
     }
   }
 
-  // Метод для стриминга (используется в эндпоинте /stream)
+  // --- Streaming via SSE ---
   async *streamChat(messages: AIMessage[], config: AIConfig = {}): AsyncGenerator<string> {
-    const apiKey = process.env.FIREWORKS_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
-      throw new Error('Fireworks API key not configured for streaming');
+      throw new Error('OpenRouter API key not configured for streaming');
     }
 
-    const model = config.model || 
-      process.env.FIREWORKS_MODEL || 
-      'accounts/fireworks/models/llama-v3p1-8b-instruct';
-    
-    const maxTokens = config.maxTokens || 
-      parseInt(process.env.DEFAULT_MAX_TOKENS || '512');
-    
-    const temperature = config.temperature || 0.7;
+    const model = config.model || process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1-0528:free';
 
     const aiMessages = this.limitContext(messages);
-    const systemMessage = aiMessages.find(m => m.role === 'system');
-    const systemPrompt = config.systemPrompt || systemMessage?.content;
-    const otherMessages = aiMessages.filter(m => m.role !== 'system');
 
-    try {
-      const { textStream } = await streamText({
-        model: fireworks(model),
-        system: systemPrompt,
-        messages: otherMessages,
-        //maxTokens,
-        temperature,
-      });
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.APP_URL || 'http://localhost',
+        'X-Title': process.env.APP_NAME || 'AI Assistant'
+      },
+      body: JSON.stringify({
+        model,
+        messages: aiMessages,
+        stream: true,
+      }),
+    });
 
-      for await (const chunk of textStream) {
-        yield chunk;
+    if (!response.body) {
+      throw new Error('No response body for streaming');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
+
+      for (const line of lines) {
+        const json = line.replace('data: ', '').trim();
+        if (json === '[DONE]') return;
+
+        try {
+          const parsed = JSON.parse(json);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            yield content;
+          }
+        } catch (err) {
+          console.warn('Failed to parse stream chunk:', err);
+        }
       }
-    } catch (error: any) {
-      console.error('Streaming error:', error);
-      // В случае ошибки возвращаем сообщение об ошибке
-      yield `Ошибка стриминга: ${error.message}`;
     }
   }
 }
